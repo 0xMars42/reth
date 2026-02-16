@@ -29,10 +29,10 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{
-    BlockExecutionOutput, BlockExecutionResult, BlockReader, ChangeSetReader,
-    DatabaseProviderFactory, HashedPostStateProvider, ProviderError, StageCheckpointReader,
-    StateProviderBox, StateProviderFactory, StateReader, StorageChangeSetReader,
-    StorageSettingsCache, TransactionVariant,
+    providers::ConsistentViewError, BlockExecutionOutput, BlockExecutionResult, BlockReader,
+    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
+    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::ControlFlow;
@@ -40,7 +40,12 @@ use reth_tasks::spawn_os_thread;
 use reth_trie_db::ChangesetCache;
 use revm::interpreter::debug_unreachable;
 use state::TreeState;
-use std::{fmt::Debug, ops, sync::Arc, time::Instant};
+use std::{
+    fmt::Debug,
+    ops,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{
@@ -93,6 +98,12 @@ pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
 
 /// A builder for creating state providers that can be used across threads.
+///
+/// Includes a consistency check that pins the database tip on first [`build`](Self::build) call
+/// and verifies it on subsequent calls, following the same pattern as
+/// [`ConsistentDbView`](reth_provider::providers::ConsistentDbView). This prevents prewarming
+/// workers from observing a newer database snapshot than the execution thread when the persistence
+/// layer commits between provider builds.
 #[derive(Clone, Debug)]
 pub struct StateProviderBuilder<N: NodePrimitives, P> {
     /// The provider factory used to create providers.
@@ -101,17 +112,20 @@ pub struct StateProviderBuilder<N: NodePrimitives, P> {
     historical: B256,
     /// The blocks that form the chain from historical to target and are in memory.
     overlay: Option<Vec<ExecutedBlock<N>>>,
+    /// Pinned database tip `(hash, number)` captured on the first [`build`](Self::build) call.
+    /// Subsequent calls verify the tip is unchanged to detect persistence advancement.
+    tip: Arc<OnceLock<(B256, u64)>>,
 }
 
 impl<N: NodePrimitives, P> StateProviderBuilder<N, P> {
     /// Creates a new state provider from the provider factory, historical block hash and optional
     /// overlaid blocks.
-    pub const fn new(
+    pub fn new(
         provider_factory: P,
         historical: B256,
         overlay: Option<Vec<ExecutedBlock<N>>>,
     ) -> Self {
-        Self { provider_factory, historical, overlay }
+        Self { provider_factory, historical, overlay, tip: Arc::new(OnceLock::new()) }
     }
 }
 
@@ -120,7 +134,33 @@ where
     P: BlockReader + StateProviderFactory + StateReader + Clone,
 {
     /// Creates a new state provider from this builder.
+    ///
+    /// On the first call, the current database tip is captured. On subsequent calls, the tip is
+    /// verified to detect whether the persistence layer has advanced. If it has, returns
+    /// [`ConsistentViewError::Reorged`] so callers (e.g. prewarming workers) can abort gracefully
+    /// instead of poisoning the execution cache with data from a newer snapshot.
+    ///
+    /// The consistency check uses `sealed_header(number)` rather than a hash-based lookup to avoid
+    /// a race condition where static files are committed before the database (see
+    /// [`ConsistentDbView`](reth_provider::providers::ConsistentDbView) for details).
     pub fn build(&self) -> ProviderResult<StateProviderBox> {
+        if let Some(&(pinned_hash, pinned_num)) = self.tip.get() {
+            // Subsequent call: verify the database tip hasn't changed.
+            if self
+                .provider_factory
+                .sealed_header(pinned_num)?
+                .is_none_or(|header| header.hash() != pinned_hash)
+            {
+                return Err(ConsistentViewError::Reorged { block: pinned_hash }.into());
+            }
+        } else {
+            // First call: capture the current database tip.
+            let last_num = self.provider_factory.last_block_number()?;
+            if let Some(header) = self.provider_factory.sealed_header(last_num)? {
+                let _ = self.tip.set((header.hash(), last_num));
+            }
+        }
+
         let mut provider = self.provider_factory.state_by_block_hash(self.historical)?;
         if let Some(overlay) = self.overlay.clone() {
             provider = Box::new(MemoryOverlayStateProvider::new(provider, overlay))

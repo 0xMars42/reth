@@ -300,8 +300,21 @@ where
             let saved_cache = prewarm_handle.saved_cache.clone();
             self.executor.spawn_blocking(move || {
                 let _enter = parent_span.entered();
-                // Build a state provider for the multiproof task
-                let provider = provider_builder.build().expect("failed to build provider");
+                // Build a state provider for the multiproof task.
+                // This can fail if persistence advanced between provider builds
+                // (consistency check). In that case, drop the task so downstream
+                // consumers (sparse trie) fall back to sequential computation.
+                let provider = match provider_builder.build() {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        warn!(
+                            target: "engine::tree::payload_processor",
+                            %err,
+                            "Failed to build state provider for multiproof task"
+                        );
+                        return;
+                    }
+                };
                 let provider = if let Some(saved_cache) = saved_cache {
                     let (cache, metrics, _disable_metrics) = saved_cache.split();
                     Box::new(CachedStateProvider::new(provider, cache, metrics))
